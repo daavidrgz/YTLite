@@ -141,8 +141,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           echo "${{ needs.check-and-decrypt.outputs.version }}" > .last_youtube_version
           git add .last_youtube_version
-          git commit -m "Update last known YouTube version to ${{ needs.check-and-decrypt.outputs.version }}"
-          git push
+          git diff --cached --quiet && echo "Version file already up to date" || {
+            git commit -m "Update last known YouTube version to ${{ needs.check-and-decrypt.outputs.version }}"
+            git push
+          }
 
   notify:
     name: Notify via Telegram
