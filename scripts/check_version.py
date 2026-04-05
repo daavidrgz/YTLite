@@ -18,6 +18,10 @@ def main():
     result = data["results"][0]
     version = result["version"]
     last_known = os.environ.get("LAST_KNOWN_VERSION", "")
+    if not last_known:
+        version_file = os.path.join(os.path.dirname(__file__), "..", ".last_youtube_version")
+        if os.path.exists(version_file):
+            last_known = open(version_file).read().strip()
     force = os.environ.get("FORCE", "false").lower() == "true"
 
     print(f"Current App Store version: {version}")

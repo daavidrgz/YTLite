@@ -37,7 +37,6 @@ jobs:
         id: check
         run: python scripts/check_version.py
         env:
-          LAST_KNOWN_VERSION: ${{ vars.YOUTUBE_LAST_VERSION }}
           FORCE: ${{ inputs.force }}
 
       - name: Install Telethon
@@ -83,7 +82,6 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
-      actions: write
 
     steps:
       - name: Checkout
@@ -138,7 +136,13 @@ jobs:
       - name: Update last known version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh variable set YOUTUBE_LAST_VERSION --body "${{ needs.check-and-decrypt.outputs.version }}"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "${{ needs.check-and-decrypt.outputs.version }}" > .last_youtube_version
+          git add .last_youtube_version
+          git commit -m "Update last known YouTube version to ${{ needs.check-and-decrypt.outputs.version }}"
+          git push
 
   notify:
     name: Notify via Telegram
