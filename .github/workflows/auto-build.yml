@@ -1,0 +1,179 @@
+name: Auto-Build YouTube Plus
+
+on:
+  schedule:
+    - cron: '0 10 * * 1'  # Every Monday 10:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force build even if version unchanged"
+        type: boolean
+        default: false
+
+concurrency:
+  group: auto-build
+  cancel-in-progress: true
+
+jobs:
+  check-and-decrypt:
+    name: Check Version & Get IPA
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      ipa_url: ${{ steps.decrypt.outputs.ipa_url }}
+      ipa_is_file: ${{ steps.decrypt.outputs.ipa_is_file }}
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check for new YouTube version
+        id: check
+        run: python scripts/check_version.py
+        env:
+          LAST_KNOWN_VERSION: ${{ vars.YOUTUBE_LAST_VERSION }}
+          FORCE: ${{ inputs.force }}
+
+      - name: Install Telethon
+        if: steps.check.outputs.should_build == 'true'
+        run: pip install telethon
+
+      - name: Get decrypted IPA from Telegram bot
+        if: steps.check.outputs.should_build == 'true'
+        id: decrypt
+        run: python scripts/get_decrypted_ipa.py
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          APP_STORE_URL: "https://apps.apple.com/us/app/youtube/id544007664"
+
+      - name: Upload IPA artifact (if bot sent file)
+        if: steps.decrypt.outputs.ipa_is_file == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: decrypted-ipa
+          path: ${{ steps.decrypt.outputs.ipa_path }}
+          retention-days: 1
+
+  build-tweaks:
+    name: Build Tweaks
+    needs: check-and-decrypt
+    if: needs.check-and-decrypt.outputs.should_build == 'true'
+    uses: ./.github/workflows/_build_tweaks.yml
+    with:
+      enable_youpip: true
+      enable_ytuhd: true
+      enable_yq: true
+      enable_ryd: true
+      enable_ytabc: true
+      enable_demc: true
+      tweak_version: "5.2b4"
+
+  package:
+    name: Package IPA
+    needs: [check-and-decrypt, build-tweaks]
+    if: needs.check-and-decrypt.outputs.should_build == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built debs
+        uses: actions/download-artifact@v7
+        with:
+          name: built-debs
+          path: ${{ github.workspace }}
+
+      - name: Download IPA (from URL)
+        if: needs.check-and-decrypt.outputs.ipa_is_file != 'true'
+        run: |
+          wget "${{ needs.check-and-decrypt.outputs.ipa_url }}" --no-verbose -O youtube.ipa
+          file_type=$(file --mime-type -b youtube.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Validation failed: not a valid IPA. Detected type: $file_type."
+            exit 1
+          fi
+
+      - name: Download IPA (from artifact)
+        if: needs.check-and-decrypt.outputs.ipa_is_file == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: decrypted-ipa
+          path: ${{ github.workspace }}
+
+      - name: Rename IPA artifact
+        if: needs.check-and-decrypt.outputs.ipa_is_file == 'true'
+        run: mv *.ipa youtube.ipa
+
+      - name: Install cyan
+        run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Inject tweaks into IPA
+        run: |
+          tweaks="ytplus.deb OpenYoutubeSafariExtension.appex"
+          for f in *.deb; do
+            [ -f "$f" ] && tweaks="$tweaks $f"
+          done
+          cyan -i youtube.ipa -o "YouTubePlus_${{ needs.check-and-decrypt.outputs.version }}.ipa" -uwef $tweaks -n "YouTube" -b com.google.ios.youtube
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          tag_name: v${{ needs.check-and-decrypt.outputs.version }}
+          name: YouTubePlus v${{ needs.check-and-decrypt.outputs.version }}
+          files: "YouTubePlus_${{ needs.check-and-decrypt.outputs.version }}.ipa"
+          draft: false
+
+      - name: Update last known version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh variable set YOUTUBE_LAST_VERSION --body "${{ needs.check-and-decrypt.outputs.version }}"
+
+  notify:
+    name: Notify via Telegram
+    needs: [check-and-decrypt, package]
+    if: always() && needs.check-and-decrypt.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Telegram notification
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VERSION: ${{ needs.check-and-decrypt.outputs.version }}
+          RESULT: ${{ needs.package.result }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then
+            RELEASE_URL="https://github.com/${REPO}/releases/tag/v${VERSION}"
+            TEXT="$(cat <<EOF
+          YouTube Plus Auto-Build Complete
+
+          YouTube version: ${VERSION}
+          Download: ${RELEASE_URL}
+          EOF
+          )"
+          else
+            TEXT="$(cat <<EOF
+          YouTube Plus Auto-Build Failed
+
+          YouTube version: ${VERSION}
+          Result: ${RESULT}
+          Run: ${RUN_URL}
+          EOF
+          )"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="${TEXT}"
